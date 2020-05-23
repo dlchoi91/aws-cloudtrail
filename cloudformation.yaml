@@ -1,0 +1,367 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Stack for creating all resources in AWS
+Parameters:
+  LogBucketName:
+    Description: Name of the bucket to use
+    Type: String
+  GlueServicePolicyArn:
+    Description: The arn for the aws glue service role
+    Type: String
+    Default: arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+  CTName:
+    Description: Name of the trail that is created
+    Type: String
+    Default: cloudtrail-default-name
+Outputs:
+  TrailBucket:
+    Description: reference name for bucket where cloudtrail logs will be published.
+    Value: !Ref TrailBucket
+  StackID:
+    Description: arn of the cloudformation stack
+    Value: !Ref "AWS::StackId"
+    Export:
+      Name: !Sub "${AWS::StackName}-StackID"
+  StackRegion:
+    Description: region of the cloudformation stack
+    Value: !Ref "AWS::Region"
+  CloudTrailLambdaARN:
+    Description: ARN for bucket where cloudtrail logs will be published.
+    Value: !GetAtt lambdatraillogconsolidate.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TrailLambdaARN"
+  TrailBucketARN:
+    Description: ARN for bucket where cloudtrail logs will be published.
+    Value: !GetAtt TrailBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TrailBucketARN"
+Resources:
+  gluecloudtrailrole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - Ref: GlueServicePolicyArn
+      RoleName: glue-cloudtraillogconsolidate-role
+  lambdacloudtrailrole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: 2012-10-17
+      RoleName: lambda-cloudtraillogconsolidate-role
+  cloudwatchpolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - lambdacloudtrailrole
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Effect: Allow
+            Resource: '*'
+          - Action:
+              - logs:CreateLogGroup
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: cloudwatch-policy
+      Roles:
+        - Ref: lambdacloudtrailrole
+  lambdatraillogconsolidate:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          from __future__ import print_function
+          import json
+          import urllib
+          import boto3
+          import gzip
+          import os
+          import re
+          import time
+          s3 = boto3.resource('s3')
+          client = boto3.client('s3')
+          glue = boto3.client('glue')
+
+          def convertColumntoLowwerCaps(obj):
+            for key in obj.keys():
+              new_key = re.sub(r'[\W]+', '', key)
+              v = obj[key]
+              if isinstance(v, dict):
+                if len(v) > 0:
+                  convertColumntoLowwerCaps(v)
+              if new_key != key:
+                obj[new_key] = obj[key]
+                del obj[key]
+            return obj
+
+          def lambda_handler(event, context):
+            bucket = event['Records'][0]['s3']['bucket']['name']
+            key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding= 'utf-8')
+            print(bucket)
+            print(key)
+            try:
+              newKey = 'flatfiles/' + key.replace("/", "")
+              client.download_file(bucket, key, '/tmp/file.json.gz')
+              with gzip.open('/tmp/out.json.gz', 'w') as output, gzip.open('/tmp/file.json.gz', 'rb') as file:
+                i = 0
+                for line in file:
+                  for record in json.loads(line, object_hook=convertColumntoLowwerCaps)['Records']:
+                    if i != 0:
+                      output.write("\n".encode('utf-8'))
+                    if 'responseelements' in record and record['responseelements'] != None and 'version' in record['responseelements']:
+                      del record['responseelements']['version']
+                    if 'requestparameters' in record and record['requestparameters'] != None and 'maxitems' in record['requestparameters']:
+                      del record['requestparameters']['maxitems']
+                    output.write(json.dumps(record).encode('utf-8'))
+                    i += 1
+              client.upload_file('/tmp/out.json.gz', bucket,newKey)
+              return "success"
+            except Exception as e:
+              print(e)
+              raise e
+            return "success"
+      #DeadLetterConfig:
+        #DeadLetterConfig
+      Description: lambda function that formats the bucket to be crawler readable
+      FunctionName: trail-logconsolidate
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt lambdacloudtrailrole.Arn
+      Runtime: python3.7
+      Timeout: 60
+  S3InvokeLambdaPermission:
+    DependsOn:
+      - lambdatraillogconsolidate
+    DeletionPolicy: Retain
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref lambdatraillogconsolidate
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${LogBucketName}'
+  TrailBucket:
+    DependsOn:
+      - lambdatraillogconsolidate
+      - S3InvokeLambdaPermission
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Ref: LogBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt lambdatraillogconsolidate.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Sub "AWSLogs/${AWS::AccountId}/CloudTrail/"
+  cloudtrailpolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - lambdacloudtrailrole
+      - TrailBucket
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:PutObject
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt TrailBucket.Arn
+                  - '/*'
+        Version: 2012-10-17
+      PolicyName: cloudtrailbucket-policy
+      Roles:
+        - Ref: lambdacloudtrailrole
+  gluecloudtrailpolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - gluecloudtrailrole
+      - TrailBucket
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt TrailBucket.Arn
+                  - '/flatfiles/*'
+          - Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt TrailBucket.Arn
+                  - '/parquettrails/*'
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt TrailBucket.Arn
+                  - '/*'
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt TrailBucket.Arn
+                  - '/gluescript/*'
+          - Action:
+              - cloudformation:DescribeStacks
+            Effect: Allow
+            Resource:
+              Ref: AWS::StackId
+        Version: 2012-10-17
+      PolicyName: cloudtrailbucket-policy
+      Roles:
+        - Ref: gluecloudtrailrole
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn:
+      - TrailBucket
+    Properties:
+      Bucket:
+        Ref: TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: "AWSCloudTrailAclCheck"
+            Effect: "Allow"
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:GetBucketAcl"
+            Resource: !GetAtt TrailBucket.Arn
+          -
+            Sid: "AWSCloudTrailWrite"
+            Effect: "Allow"
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "s3:PutObject"
+            Resource:
+              !Sub |-
+                arn:aws:s3:::${LogBucketName}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: "bucket-owner-full-control"
+  myTrail:
+    DependsOn:
+      - TrailBucketPolicy
+      - TrailBucket
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName:
+        Ref: TrailBucket
+      IsLogging: false
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      TrailName: !Ref CTName
+      EnableLogFileValidation: true
+  cloudtrailcrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - TrailBucket
+      - gluecloudtrailrole
+    Properties:
+      DatabaseName: cloudtrail
+      Description: crawls the s3 bucket for cloudtrail logs
+      Name: cloudtrailcrawler
+      Role: !GetAtt gluecloudtrailrole.Arn
+      #Schedule: none run on demand homie
+      #SchemaChangePolicy:
+      #  SchemaChangePolicy
+      Targets:
+        S3Targets:
+          - Path:
+              !Join
+              - ''
+              - - s3://
+                - !Ref TrailBucket
+                - /flatfiles/
+  gluecloudtrailjob:
+    Type: AWS::Glue::Job
+    DependsOn:
+      - TrailBucket
+      - gluecloudtrailrole
+    Properties:
+      Command:
+        Name: glueetl
+        ScriptLocation:
+          !Join
+          - ''
+          - - s3://
+            - !Ref TrailBucket
+            - /gluescript/cloudtrail_glue.py
+      MaxCapacity: 2
+      GlueVersion: 1.0
+      Timeout: 5
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--cfstackname": !Ref "AWS::StackName"
+        "--region_name": !Ref "AWS::Region"
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      Name: cloudtraillogsparquetjob
+      Role: !GetAtt gluecloudtrailrole.Arn
+  glueparquetoutputcrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - TrailBucket
+      - gluecloudtrailrole
+    Properties:
+      DatabaseName: cloudtrail
+      Description: crawls the parquet outputs from the glue job for cloudtrail logs
+      Name: cloudtrailparquetcrawler
+      Role: !GetAtt gluecloudtrailrole.Arn
+      #Schedule: none run on demand homie
+      #SchemaChangePolicy:
+      #  SchemaChangePolicy
+      Targets:
+        S3Targets:
+          - Path:
+              !Join
+              - ''
+              - - s3://
+                - !Ref TrailBucket
+                - /parquettrails/

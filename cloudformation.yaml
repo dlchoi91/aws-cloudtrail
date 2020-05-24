@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: Stack for creating all resources in AWS
 Parameters:
   LogBucketName:
-    Description: Name of the bucket to use
+    Description: Name of the bucket to store trail logs
     Type: String
   GlueServicePolicyArn:
     Description: The arn for the aws glue service role
@@ -150,7 +150,6 @@ Resources:
   S3InvokeLambdaPermission:
     DependsOn:
       - lambdatraillogconsolidate
-    DeletionPolicy: Retain
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
@@ -334,7 +333,7 @@ Resources:
             - /gluescript/cloudtrail_glue.py
       MaxCapacity: 2
       GlueVersion: 1.0
-      Timeout: 5
+      Timeout: 10
       DefaultArguments:
         "--job-bookmark-option": "job-bookmark-enable"
         "--cfstackname": !Ref "AWS::StackName"

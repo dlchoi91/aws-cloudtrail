@@ -1,6 +1,6 @@
-# aws-security
+# aws-cloudtrail
 
-The following repository is a sample workflow for an ETL for CloudTrail logs that can be queried using either AWS Athena or can be further copied into redshift. The json logs will be formatted by AWS Lambda and Glue Crawlers will update the data catalog so that a Glue Job can output into a columnar parquet file. There are currently two cloudformation templates (yaml).
+The following repository is a sample workflow for an ETL for CloudTrail logs that can be queried using either AWS Athena or can be further copied into redshift. The json logs will be formatted by AWS Lambda and Glue Crawlers will update the data catalog so that a Glue Job can output into a columnar parquet file.
 
 The stack launches all the resources needed for the workflow defined below. The stack will launch with the trail not set to record and must be turned on manually. The glue crawlers and job are not activated as well and need to be scheduled on your own based on your own personal requirements. The event source mapping for the lambda function is enabled by default.
 
